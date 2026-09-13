@@ -9,22 +9,45 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+  actions: read
+
 jobs:
   deploy-staging:
     name: Deploy to Staging
     runs-on: ubuntu-latest
 
     if: >
-      ${{ github.event.workflow_run.conclusion == 'success' }}
+      ${{ github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.head_repository.full_name == github.repository }}
 
     environment:
       name: staging
 
+    env:
+      ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
+
     steps:
-      - name: Checkout tested commit
+      - name: Validate original CI image SHA
+        id: image
+        env:
+          ORIGINAL_CI_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$ORIGINAL_CI_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "The CI workflow did not provide a valid image SHA." >&2
+            exit 1
+          fi
+
+          echo "image_sha=$ORIGINAL_CI_SHA" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_SHA=$ORIGINAL_CI_SHA" >> "$GITHUB_ENV"
+
+      - name: Checkout original CI commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ steps.image.outputs.image_sha }}
 
       - name: Login to Azure
         uses: azure/login@v3
@@ -75,37 +98,37 @@ jobs:
       - name: Update frontend image
         run: |
           kubectl set image deployment/frontend \
-            frontend=${{ vars.ACR_LOGIN_SERVER }}/koalatech-frontend:${{ github.event.workflow_run.head_sha }} \
+            frontend="${ACR_LOGIN_SERVER}/koalatech-frontend:${IMAGE_SHA}" \
             -n staging
 
       - name: Update user-service image
         run: |
           kubectl set image deployment/user-service \
-            user-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-user-service:${{ github.event.workflow_run.head_sha }} \
+            user-service="${ACR_LOGIN_SERVER}/koalatech-user-service:${IMAGE_SHA}" \
             -n staging
 
       - name: Update student-service image
         run: |
           kubectl set image deployment/student-service \
-            student-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-student-service:${{ github.event.workflow_run.head_sha }} \
+            student-service="${ACR_LOGIN_SERVER}/koalatech-student-service:${IMAGE_SHA}" \
             -n staging
 
       - name: Update lecturer-service image
         run: |
           kubectl set image deployment/lecturer-service \
-            lecturer-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-lecturer-service:${{ github.event.workflow_run.head_sha }} \
+            lecturer-service="${ACR_LOGIN_SERVER}/koalatech-lecturer-service:${IMAGE_SHA}" \
             -n staging
 
       - name: Update course-service image
         run: |
           kubectl set image deployment/course-service \
-            course-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-course-service:${{ github.event.workflow_run.head_sha }} \
+            course-service="${ACR_LOGIN_SERVER}/koalatech-course-service:${IMAGE_SHA}" \
             -n staging
 
       - name: Update enrollment-service image
         run: |
           kubectl set image deployment/enrollment-service \
-            enrollment-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-enrollment-service:${{ github.event.workflow_run.head_sha }} \
+            enrollment-service="${ACR_LOGIN_SERVER}/koalatech-enrollment-service:${IMAGE_SHA}" \
             -n staging
 
       - name: Wait for frontend rollout
@@ -143,6 +166,18 @@ jobs:
           kubectl rollout status deployment/enrollment-service \
             -n staging \
             --timeout=300s
+
+      - name: Record staged release
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$IMAGE_SHA" > image-tag.txt
+
+      - name: Upload staged release
+        uses: actions/upload-artifact@v7
+        with:
+          name: staged-release
+          path: image-tag.txt
+          if-no-files-found: error
 
       - name: Show staging resources
         run: |

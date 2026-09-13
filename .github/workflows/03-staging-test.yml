@@ -9,18 +9,61 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+  actions: read
+
 jobs:
   smoke-test:
     name: Staging Smoke Test
     runs-on: ubuntu-latest
 
     if: >
-      ${{ github.event.workflow_run.conclusion == 'success' }}
+      ${{ github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.head_repository.full_name == github.repository }}
 
     environment:
       name: staging
 
+    env:
+      ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
+
     steps:
+      - name: Download staged release
+        uses: actions/download-artifact@v8
+        with:
+          name: staged-release
+          path: release
+          repository: ${{ github.repository }}
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      - name: Validate staged image SHA
+        id: release
+        run: |
+          set -euo pipefail
+
+          release_file="$GITHUB_WORKSPACE/release/image-tag.txt"
+          if [[ ! -f "$release_file" ]]; then
+            echo "The staged release artifact did not contain image-tag.txt." >&2
+            exit 1
+          fi
+
+          mapfile -t release_lines < "$release_file"
+          if (( ${#release_lines[@]} != 1 )); then
+            echo "The staged release artifact must contain exactly one line." >&2
+            exit 1
+          fi
+
+          image_sha="${release_lines[0]}"
+          if [[ ! "$image_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "The staged release artifact did not contain a valid image SHA." >&2
+            exit 1
+          fi
+
+          echo "image_sha=$image_sha" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_SHA=$image_sha" >> "$GITHUB_ENV"
+
       - name: Login to Azure
         uses: azure/login@v3
         with:
@@ -32,6 +75,33 @@ jobs:
             --resource-group ${{ vars.AKS_RESOURCE_GROUP }} \
             --name ${{ vars.AKS_CLUSTER_NAME }} \
             --overwrite-existing
+
+      - name: Verify staging deployment images
+        env:
+          EXPECTED_IMAGE_SHA: ${{ steps.release.outputs.image_sha }}
+        run: |
+          set -euo pipefail
+
+          deployments=(
+            frontend
+            user-service
+            student-service
+            lecturer-service
+            course-service
+            enrollment-service
+          )
+
+          for deployment in "${deployments[@]}"; do
+            expected_image="${ACR_LOGIN_SERVER}/koalatech-${deployment}:${EXPECTED_IMAGE_SHA}"
+            actual_image="$(kubectl get deployment "$deployment" \
+              -n staging \
+              -o jsonpath='{.spec.template.spec.containers[0].image}')"
+
+            if [[ "$actual_image" != "$expected_image" ]]; then
+              echo "${deployment} is using ${actual_image}, expected ${expected_image}." >&2
+              exit 1
+            fi
+          done
 
       - name: Wait for staging frontend IP
         run: |
@@ -60,4 +130,11 @@ jobs:
             --fail \
             --retry 10 \
             --retry-delay 5 \
-            http://${{ env.FRONTEND_IP }}
+            "http://${FRONTEND_IP}"
+
+      - name: Upload tested release
+        uses: actions/upload-artifact@v7
+        with:
+          name: tested-release
+          path: release/image-tag.txt
+          if-no-files-found: error
