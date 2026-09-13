@@ -10,24 +10,29 @@ on:
       - main
 
 permissions:
+  id-token: write
   contents: read
   actions: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: staging-deployment
+  cancel-in-progress: false
 
 jobs:
   deploy-staging:
     name: Deploy to Staging
     runs-on: ubuntu-latest
-
     if: >
       ${{ github.event.workflow_run.conclusion == 'success' &&
           github.event.workflow_run.head_repository.full_name == github.repository }}
-
     environment:
       name: staging
-
     env:
       ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
-
     steps:
       - name: Validate original CI image SHA
         id: image
@@ -35,24 +40,24 @@ jobs:
           ORIGINAL_CI_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
-
           if [[ ! "$ORIGINAL_CI_SHA" =~ ^[0-9a-f]{40}$ ]]; then
             echo "The CI workflow did not provide a valid image SHA." >&2
             exit 1
           fi
-
           echo "image_sha=$ORIGINAL_CI_SHA" >> "$GITHUB_OUTPUT"
           echo "IMAGE_SHA=$ORIGINAL_CI_SHA" >> "$GITHUB_ENV"
 
       - name: Checkout original CI commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ steps.image.outputs.image_sha }}
 
-      - name: Login to Azure
+      - name: Login to Azure with OIDC
         uses: azure/login@v3
         with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          client-id: ${{ vars.AZURE_CLIENT_ID_102D }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID_102D }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID_102D }}
 
       - name: Get AKS credentials
         run: |
@@ -61,11 +66,36 @@ jobs:
             --name ${{ vars.AKS_CLUSTER_NAME }} \
             --overwrite-existing
 
-      - name: Create staging namespace
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.19.0
+
+      - name: Install monitoring stack
         run: |
-          kubectl create namespace staging \
-            --dry-run=client \
-            -o yaml | kubectl apply -f -
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo update
+          helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
+            --version 90.2.0 \
+            --namespace monitoring \
+            --create-namespace \
+            --values kubernetes/monitoring/values.yaml \
+            --wait \
+            --timeout 10m
+
+      - name: Create staging namespace
+        run: kubectl create namespace staging --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Retrieve application storage connection
+        run: |
+          set -euo pipefail
+          storage_connection="$(az storage account show-connection-string \
+            --resource-group sit722-102d-rg \
+            --name sit722102dapp2304184 \
+            --query connectionString \
+            -o tsv)"
+          echo "::add-mask::$storage_connection"
+          printf 'AZURE_STORAGE_CONNECTION_STRING=%s\n' "$storage_connection" >> "$GITHUB_ENV"
 
       - name: Create PostgreSQL secret
         run: |
@@ -86,86 +116,124 @@ jobs:
             --from-literal=DEFAULT_ADMIN_USERNAME="${{ secrets.DEFAULT_ADMIN_USERNAME }}" \
             --from-literal=DEFAULT_ADMIN_EMAIL="${{ secrets.DEFAULT_ADMIN_EMAIL }}" \
             --from-literal=DEFAULT_ADMIN_PASSWORD="${{ secrets.DEFAULT_ADMIN_PASSWORD }}" \
-            --from-literal=AZURE_STORAGE_CONNECTION_STRING="${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}" \
+            --from-literal=AZURE_STORAGE_CONNECTION_STRING="$AZURE_STORAGE_CONNECTION_STRING" \
             --dry-run=client \
             -o yaml | kubectl apply -f -
 
       - name: Apply Kubernetes manifests
-        run: |
-          kubectl apply \
-            -f kubernetes/staging/
+        run: kubectl apply -f kubernetes/staging/
 
       - name: Update frontend image
-        run: |
-          kubectl set image deployment/frontend \
-            frontend="${ACR_LOGIN_SERVER}/koalatech-frontend:${IMAGE_SHA}" \
-            -n staging
+        run: kubectl set image deployment/frontend frontend="${ACR_LOGIN_SERVER}/koalatech-frontend:${IMAGE_SHA}" -n staging
 
       - name: Update user-service image
-        run: |
-          kubectl set image deployment/user-service \
-            user-service="${ACR_LOGIN_SERVER}/koalatech-user-service:${IMAGE_SHA}" \
-            -n staging
+        run: kubectl set image deployment/user-service user-service="${ACR_LOGIN_SERVER}/koalatech-user-service:${IMAGE_SHA}" -n staging
 
       - name: Update student-service image
-        run: |
-          kubectl set image deployment/student-service \
-            student-service="${ACR_LOGIN_SERVER}/koalatech-student-service:${IMAGE_SHA}" \
-            -n staging
+        run: kubectl set image deployment/student-service student-service="${ACR_LOGIN_SERVER}/koalatech-student-service:${IMAGE_SHA}" -n staging
 
       - name: Update lecturer-service image
-        run: |
-          kubectl set image deployment/lecturer-service \
-            lecturer-service="${ACR_LOGIN_SERVER}/koalatech-lecturer-service:${IMAGE_SHA}" \
-            -n staging
+        run: kubectl set image deployment/lecturer-service lecturer-service="${ACR_LOGIN_SERVER}/koalatech-lecturer-service:${IMAGE_SHA}" -n staging
 
       - name: Update course-service image
-        run: |
-          kubectl set image deployment/course-service \
-            course-service="${ACR_LOGIN_SERVER}/koalatech-course-service:${IMAGE_SHA}" \
-            -n staging
+        run: kubectl set image deployment/course-service course-service="${ACR_LOGIN_SERVER}/koalatech-course-service:${IMAGE_SHA}" -n staging
 
       - name: Update enrollment-service image
-        run: |
-          kubectl set image deployment/enrollment-service \
-            enrollment-service="${ACR_LOGIN_SERVER}/koalatech-enrollment-service:${IMAGE_SHA}" \
-            -n staging
+        run: kubectl set image deployment/enrollment-service enrollment-service="${ACR_LOGIN_SERVER}/koalatech-enrollment-service:${IMAGE_SHA}" -n staging
 
       - name: Wait for frontend rollout
-        run: |
-          kubectl rollout status deployment/frontend \
-            -n staging \
-            --timeout=300s
+        run: kubectl rollout status deployment/frontend -n staging --timeout=600s
 
       - name: Wait for user-service rollout
-        run: |
-          kubectl rollout status deployment/user-service \
-            -n staging \
-            --timeout=300s
+        run: kubectl rollout status deployment/user-service -n staging --timeout=600s
 
       - name: Wait for student-service rollout
-        run: |
-          kubectl rollout status deployment/student-service \
-            -n staging \
-            --timeout=300s
+        run: kubectl rollout status deployment/student-service -n staging --timeout=600s
 
       - name: Wait for lecturer-service rollout
-        run: |
-          kubectl rollout status deployment/lecturer-service \
-            -n staging \
-            --timeout=300s
+        run: kubectl rollout status deployment/lecturer-service -n staging --timeout=600s
 
       - name: Wait for course-service rollout
-        run: |
-          kubectl rollout status deployment/course-service \
-            -n staging \
-            --timeout=300s
+        run: kubectl rollout status deployment/course-service -n staging --timeout=600s
 
       - name: Wait for enrollment-service rollout
+        run: kubectl rollout status deployment/enrollment-service -n staging --timeout=600s
+
+      - name: Apply named monitoring manifests
         run: |
-          kubectl rollout status deployment/enrollment-service \
-            -n staging \
-            --timeout=300s
+          kubectl apply -f kubernetes/monitoring/user-service-monitor.yaml
+          kubectl apply -f kubernetes/monitoring/user-service-dashboard.yaml
+
+      - name: Verify staging deployment and Prometheus
+        run: |
+          set -euo pipefail
+          test "$(kubectl get deployment user-service -n staging -o jsonpath='{.metadata.namespace}')" = staging
+          kubectl wait --for=condition=Ready pod \
+            -l app.kubernetes.io/instance=prometheus \
+            -n monitoring \
+            --timeout=600s
+          kubectl get servicemonitor user-service -n monitoring
+          kubectl get configmap user-service-dashboard -n monitoring
+
+      - name: Verify user-service metrics
+        run: |
+          set -euo pipefail
+          kubectl port-forward service/user-service 18000:http -n staging >/tmp/user-service-port-forward.log 2>&1 &
+          forward_pid=$!
+          trap 'kill "$forward_pid" 2>/dev/null || true' EXIT
+          python - <<'PY'
+          import time
+          from urllib.error import URLError
+          from urllib.request import urlopen
+
+          expected = (
+              "user_service_http_requests_total",
+              "user_service_http_request_duration_seconds",
+          )
+          for attempt in range(60):
+              try:
+                  try:
+                      urlopen("http://127.0.0.1:18000/health", timeout=3).read()
+                  except Exception:
+                      pass
+                  metrics = urlopen("http://127.0.0.1:18000/metrics", timeout=3).read().decode()
+                  missing = [name for name in expected if name not in metrics]
+                  if not missing:
+                      print("Verified user-service metrics:", ", ".join(expected))
+                      break
+              except URLError:
+                  pass
+              if attempt == 59:
+                  raise AssertionError(f"Metrics unavailable or missing: {missing if 'missing' in locals() else expected}")
+              time.sleep(5)
+          PY
+
+      - name: Verify Prometheus is scraping user-service
+        run: |
+          set -euo pipefail
+          kubectl port-forward service/prometheus-kube-prometheus-prometheus 19090:9090 -n monitoring >/tmp/prometheus-port-forward.log 2>&1 &
+          forward_pid=$!
+          trap 'kill "$forward_pid" 2>/dev/null || true' EXIT
+          python - <<'PY'
+          import json
+          import time
+          from urllib.parse import urlencode
+          from urllib.request import urlopen
+
+          query = urlencode({"query": 'up{namespace="staging",service="user-service"}'})
+          url = f"http://127.0.0.1:19090/api/v1/query?{query}"
+          for attempt in range(60):
+              try:
+                  result = json.load(urlopen(url, timeout=3))["data"]["result"]
+                  if result and all(float(item["value"][1]) == 1 for item in result):
+                      print("Prometheus user-service target is up.")
+                      break
+              except Exception:
+                  pass
+              if attempt == 59:
+                  raise AssertionError("Prometheus did not report the staging user-service target as up")
+              time.sleep(5)
+          PY
 
       - name: Record staged release
         run: |

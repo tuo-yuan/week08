@@ -1,94 +1,87 @@
 name: 01 - CI
 
 on:
-  # Trigger the workflow on push to main branch
   push:
     branches:
       - main
-  
-  # Manual trigger for the workflow
   workflow_dispatch:
 
+permissions:
+  id-token: write
+  contents: read
+  actions: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: sit722-102d-ci
+  cancel-in-progress: false
 
 jobs:
-
-  # =========================================================
-  # Backend Tests
-  # =========================================================
   backend-test:
     name: Test ${{ matrix.service }}
     runs-on: ubuntu-latest
-
     strategy:
       fail-fast: false
-
       matrix:
         include:
           - service: user-service
             database: users
             port: 5433
-
           - service: student-service
             database: students
             port: 5434
-
           - service: lecturer-service
             database: lecturers
             port: 5435
-
           - service: course-service
             database: courses
             port: 5436
-
           - service: enrollment-service
             database: enrollments
             port: 5437
-
     services:
       postgres:
         image: postgres:16
-
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: ${{ matrix.database }}
-
         ports:
           - ${{ matrix.port }}:5432
-
         options: >-
           --health-cmd="pg_isready -U postgres -d ${{ matrix.database }}"
           --health-interval=5s
           --health-timeout=5s
           --health-retries=10
-
     env:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: ${{ matrix.database }}
       POSTGRES_HOST: localhost
       POSTGRES_PORT: ${{ matrix.port }}
-
       JWT_SECRET_KEY: koalatech-ci-test-secret
       JWT_ALGORITHM: HS256
       ACCESS_TOKEN_EXPIRE_MINUTES: 30
-
       DEFAULT_ADMIN_USERNAME: admin
       DEFAULT_ADMIN_EMAIL: admin@koalatech.edu.au
       DEFAULT_ADMIN_PASSWORD: AdminPassword123!
-
       AZURE_STORAGE_CONNECTION_STRING: ""
       AZURE_STORAGE_CONTAINER_NAME: ""
-
     steps:
-
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+
+      - name: Check workflow ordering and security controls
+        if: matrix.service == 'user-service'
+        run: python test_workflows.py
 
       - name: Install dependencies
         working-directory: ${{ matrix.service }}
@@ -98,69 +91,223 @@ jobs:
 
       - name: Run tests
         working-directory: ${{ matrix.service }}
-        run: |
-          pytest -v
+        run: pytest -v
 
-
-  # =========================================================
-  # Build and Push Docker Images
-  # =========================================================
-  build-and-push:
-    name: Build and Push ${{ matrix.image }}
+  infrastructure:
+    name: Provision Azure infrastructure
     runs-on: ubuntu-latest
-
-    # All backend tests must pass before this job starts
     needs:
       - backend-test
+    env:
+      ARM_USE_OIDC: "true"
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID_102D }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID_102D }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID_102D }}
+      TF_VAR_location: eastus
+      TF_VAR_resource_group_name: sit722-102d-rg
+      TF_VAR_acr_name: sit722102d2304184
+      TF_VAR_storage_account_name: sit722102dapp2304184
+      TF_VAR_aks_cluster_name: sit722-102d-aks
+      TF_VAR_aks_dns_prefix: sit722-102d
+      TF_VAR_aks_node_count: "3"
+      TF_VAR_aks_node_vm_size: Standard_DS2_v2
+      TF_VAR_environment: 10.2D
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
 
-    # Build and push when code is pushed to main or manually triggered
+      - name: Login to Azure with OIDC
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID_102D }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID_102D }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID_102D }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.15.8
+          terraform_wrapper: false
+
+      - name: Terraform init
+        run: |
+          set -euo pipefail
+          mkdir -p reports
+          terraform init -no-color \
+            -backend-config="resource_group_name=sit722-102d-state-rg" \
+            -backend-config="storage_account_name=sit722102dtf2304184" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=week08-102d.tfstate" \
+            -backend-config="use_oidc=true" 2>&1 \
+            | sed -E 's/(connection_string|access_key|client_secret)[^ ]*/\1=[REDACTED]/Ig' \
+            | tee reports/init.txt
+
+      - name: Terraform format check
+        run: terraform fmt -check -recursive -no-color 2>&1 | tee reports/fmt-check.txt
+
+      - name: Terraform validate
+        run: terraform validate -no-color 2>&1 | tee reports/validate.txt
+
+      - name: Import pre-created resource group when absent from state
+        run: |
+          set -euo pipefail
+          if ! terraform state show azurerm_resource_group.rg >/dev/null 2>&1; then
+            terraform import -no-color azurerm_resource_group.rg \
+              "/subscriptions/${ARM_SUBSCRIPTION_ID}/resourceGroups/sit722-102d-rg" 2>&1 \
+              | sed -E 's/(connection_string|access_key|client_secret)[^ ]*/\1=[REDACTED]/Ig' \
+              | tee reports/import.txt
+          else
+            echo "Resource group is already managed." | tee reports/import.txt
+          fi
+
+      - name: Terraform plan
+        run: |
+          set -euo pipefail
+          terraform plan -no-color -out=tfplan 2>&1 \
+            | sed -E 's/(connection_string|access_key|client_secret)[^ ]*/\1=[REDACTED]/Ig' \
+            | tee reports/plan.txt
+
+      - name: Terraform apply saved plan
+        run: |
+          set -euo pipefail
+          terraform apply -no-color -auto-approve tfplan 2>&1 \
+            | sed -E 's/(connection_string|access_key|client_secret)[^ ]*/\1=[REDACTED]/Ig' \
+            | tee reports/apply.txt
+
+      - name: Upload redacted Terraform text logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: terraform-logs
+          path: terraform/reports/*.txt
+          if-no-files-found: warn
+
+  build-and-push:
+    name: Build, scan and push ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    needs:
+      - backend-test
+      - infrastructure
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-
     strategy:
       fail-fast: false
-
       matrix:
         include:
           - service: frontend
             image: koalatech-frontend
-
+            multipart-gate: false
           - service: user-service
             image: koalatech-user-service
-
+            multipart-gate: true
           - service: student-service
             image: koalatech-student-service
-
+            multipart-gate: true
           - service: lecturer-service
             image: koalatech-lecturer-service
-
+            multipart-gate: true
           - service: course-service
             image: koalatech-course-service
-
+            multipart-gate: false
           - service: enrollment-service
             image: koalatech-enrollment-service
-
+            multipart-gate: false
     steps:
-
       - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Login to Azure
-        uses: azure/login@v2
+        uses: actions/checkout@v5
         with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          fetch-depth: 0
+
+      - name: Login to Docker Hub
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: printf '%s' "$DOCKERHUB_TOKEN" | docker login --username "$DOCKERHUB_USERNAME" --password-stdin
+
+      - name: Login to Azure with OIDC
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID_102D }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID_102D }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID_102D }}
 
       - name: Login to Azure Container Registry
+        run: az acr login --name sit722102d2304184
+
+      - name: Install Docker Scout CLI 1.24.0
         run: |
-          az acr login --name ${{ vars.ACR_NAME }}
+          set -euo pipefail
+          release=https://github.com/docker/scout-cli/releases/download/v1.24.0
+          archive=docker-scout_1.24.0_linux_amd64.tar.gz
+          curl -fsSL "$release/$archive" -o "$RUNNER_TEMP/$archive"
+          curl -fsSL "$release/docker-scout_1.24.0_checksums.txt" -o "$RUNNER_TEMP/scout-checksums.txt"
+          (cd "$RUNNER_TEMP" && grep " $archive$" scout-checksums.txt | sha256sum --check)
+          mkdir -p "$HOME/.docker/cli-plugins"
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$HOME/.docker/cli-plugins" docker-scout
+          chmod +x "$HOME/.docker/cli-plugins/docker-scout"
+          docker scout version
+
+      - name: Build baseline user-service image
+        if: matrix.service == 'user-service'
+        run: |
+          set -euo pipefail
+          baseline_dir="$RUNNER_TEMP/baseline-user-service"
+          mkdir -p "$baseline_dir"
+          git archive 8aa54a49df760324b210703b9edbc37bd1c6f82c user-service \
+            | tar -x -C "$baseline_dir" --strip-components=1
+          docker build --platform linux/amd64 -t baseline-user-service:8aa54a4 "$baseline_dir"
+
+      - name: Record baseline python-multipart findings
+        if: matrix.service == 'user-service'
+        run: |
+          mkdir -p scout-reports
+          docker scout cves --only-package python-multipart baseline-user-service:8aa54a4 \
+            | tee scout-reports/baseline-user-service-python-multipart.txt
 
       - name: Build Docker image
+        env:
+          IMAGE: ${{ vars.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ github.sha }}
+        run: docker build --platform linux/amd64 -t "$IMAGE" ./${{ matrix.service }}
+
+      - name: Record full advisory Scout findings
+        env:
+          IMAGE: ${{ vars.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ github.sha }}
         run: |
-          docker build \
-            --platform linux/amd64 \
-            -t ${{ vars.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ github.sha }} \
-            ./${{ matrix.service }}
+          set -euo pipefail
+          mkdir -p scout-reports
+          docker scout cves "$IMAGE" | tee "scout-reports/${{ matrix.image }}-cves.txt"
+          docker scout recommendations "$IMAGE" | tee "scout-reports/${{ matrix.image }}-recommendations.txt"
+          printf '%s\n' \
+            'Full findings remain advisory only in this isolated teaching lab, including its production-named namespace; remaining critical/high findings are NOT cleared.' \
+            'Production security requires a broad severity gate in addition to the mandatory python-multipart gate.' \
+            > "scout-reports/${{ matrix.image }}-scope.txt"
+
+      - name: Record user-service policy evaluation
+        if: matrix.service == 'user-service'
+        env:
+          IMAGE: ${{ vars.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ github.sha }}
+        run: docker scout policy "$IMAGE" | tee scout-reports/user-service-policy.txt
+
+      - name: Enforce python-multipart remediation
+        if: matrix.multipart-gate
+        env:
+          IMAGE: ${{ vars.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ github.sha }}
+        run: |
+          set -euo pipefail
+          docker scout cves --exit-code --only-package python-multipart "$IMAGE" \
+            | tee "scout-reports/${{ matrix.image }}-python-multipart-gate.txt"
 
       - name: Push Docker image with commit SHA
-        run: |
-          docker push \
-            ${{ vars.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ github.sha }}
+        env:
+          IMAGE: ${{ vars.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ github.sha }}
+        run: docker push "$IMAGE"
+
+      - name: Upload Docker Scout reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: scout-${{ matrix.image }}
+          path: scout-reports/*.txt
+          if-no-files-found: error

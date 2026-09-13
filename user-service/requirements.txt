@@ -5,7 +5,8 @@ psycopg2-binary==2.9.10
 pydantic[email]==2.11.7
 PyJWT
 pwdlib[argon2]==0.2.1
-python-multipart==0.0.20
+python-multipart==0.0.32
 pytest==8.4.1
 httpx==0.28.1
+prometheus-client==0.26.0
 python-dotenv==1.0.1

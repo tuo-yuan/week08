@@ -10,8 +10,13 @@ on:
       - main
 
 permissions:
+  id-token: write
   contents: read
   actions: read
+
+defaults:
+  run:
+    shell: bash
 
 concurrency:
   group: production-deployment
@@ -21,17 +26,13 @@ jobs:
   deploy-production:
     name: Deploy to Production
     runs-on: ubuntu-latest
-
     if: >
       ${{ github.event.workflow_run.conclusion == 'success' &&
           github.event.workflow_run.head_repository.full_name == github.repository }}
-
     environment:
       name: production
-
     env:
       ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
-
     steps:
       - name: Download tested release
         uses: actions/download-artifact@v8
@@ -46,37 +47,35 @@ jobs:
         id: release
         run: |
           set -euo pipefail
-
           release_file="$GITHUB_WORKSPACE/release/image-tag.txt"
           if [[ ! -f "$release_file" ]]; then
             echo "The tested release artifact did not contain image-tag.txt." >&2
             exit 1
           fi
-
           mapfile -t release_lines < "$release_file"
           if (( ${#release_lines[@]} != 1 )); then
             echo "The tested release artifact must contain exactly one line." >&2
             exit 1
           fi
-
           image_sha="${release_lines[0]}"
           if [[ ! "$image_sha" =~ ^[0-9a-f]{40}$ ]]; then
             echo "The tested release artifact did not contain a valid image SHA." >&2
             exit 1
           fi
-
           echo "image_sha=$image_sha" >> "$GITHUB_OUTPUT"
           echo "IMAGE_SHA=$image_sha" >> "$GITHUB_ENV"
 
       - name: Checkout tested commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ steps.release.outputs.image_sha }}
 
-      - name: Login to Azure
+      - name: Login to Azure with OIDC
         uses: azure/login@v3
         with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          client-id: ${{ vars.AZURE_CLIENT_ID_102D }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID_102D }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID_102D }}
 
       - name: Get AKS credentials
         run: |
@@ -86,10 +85,18 @@ jobs:
             --overwrite-existing
 
       - name: Create production namespace
+        run: kubectl create namespace production --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Retrieve application storage connection
         run: |
-          kubectl create namespace production \
-            --dry-run=client \
-            -o yaml | kubectl apply -f -
+          set -euo pipefail
+          storage_connection="$(az storage account show-connection-string \
+            --resource-group sit722-102d-rg \
+            --name sit722102dapp2304184 \
+            --query connectionString \
+            -o tsv)"
+          echo "::add-mask::$storage_connection"
+          printf 'AZURE_STORAGE_CONNECTION_STRING=%s\n' "$storage_connection" >> "$GITHUB_ENV"
 
       - name: Create PostgreSQL secret
         run: |
@@ -110,86 +117,48 @@ jobs:
             --from-literal=DEFAULT_ADMIN_USERNAME="${{ secrets.DEFAULT_ADMIN_USERNAME }}" \
             --from-literal=DEFAULT_ADMIN_EMAIL="${{ secrets.DEFAULT_ADMIN_EMAIL }}" \
             --from-literal=DEFAULT_ADMIN_PASSWORD="${{ secrets.DEFAULT_ADMIN_PASSWORD }}" \
-            --from-literal=AZURE_STORAGE_CONNECTION_STRING="${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}" \
+            --from-literal=AZURE_STORAGE_CONNECTION_STRING="$AZURE_STORAGE_CONNECTION_STRING" \
             --dry-run=client \
             -o yaml | kubectl apply -f -
 
       - name: Apply Kubernetes manifests
-        run: |
-          kubectl apply \
-            -f kubernetes/production/
+        run: kubectl apply -f kubernetes/production/
 
       - name: Update frontend image
-        run: |
-          kubectl set image deployment/frontend \
-            frontend="${ACR_LOGIN_SERVER}/koalatech-frontend:${IMAGE_SHA}" \
-            -n production
+        run: kubectl set image deployment/frontend frontend="${ACR_LOGIN_SERVER}/koalatech-frontend:${IMAGE_SHA}" -n production
 
       - name: Update user-service image
-        run: |
-          kubectl set image deployment/user-service \
-            user-service="${ACR_LOGIN_SERVER}/koalatech-user-service:${IMAGE_SHA}" \
-            -n production
+        run: kubectl set image deployment/user-service user-service="${ACR_LOGIN_SERVER}/koalatech-user-service:${IMAGE_SHA}" -n production
 
       - name: Update student-service image
-        run: |
-          kubectl set image deployment/student-service \
-            student-service="${ACR_LOGIN_SERVER}/koalatech-student-service:${IMAGE_SHA}" \
-            -n production
+        run: kubectl set image deployment/student-service student-service="${ACR_LOGIN_SERVER}/koalatech-student-service:${IMAGE_SHA}" -n production
 
       - name: Update lecturer-service image
-        run: |
-          kubectl set image deployment/lecturer-service \
-            lecturer-service="${ACR_LOGIN_SERVER}/koalatech-lecturer-service:${IMAGE_SHA}" \
-            -n production
+        run: kubectl set image deployment/lecturer-service lecturer-service="${ACR_LOGIN_SERVER}/koalatech-lecturer-service:${IMAGE_SHA}" -n production
 
       - name: Update course-service image
-        run: |
-          kubectl set image deployment/course-service \
-            course-service="${ACR_LOGIN_SERVER}/koalatech-course-service:${IMAGE_SHA}" \
-            -n production
+        run: kubectl set image deployment/course-service course-service="${ACR_LOGIN_SERVER}/koalatech-course-service:${IMAGE_SHA}" -n production
 
       - name: Update enrollment-service image
-        run: |
-          kubectl set image deployment/enrollment-service \
-            enrollment-service="${ACR_LOGIN_SERVER}/koalatech-enrollment-service:${IMAGE_SHA}" \
-            -n production
+        run: kubectl set image deployment/enrollment-service enrollment-service="${ACR_LOGIN_SERVER}/koalatech-enrollment-service:${IMAGE_SHA}" -n production
 
       - name: Wait for frontend rollout
-        run: |
-          kubectl rollout status deployment/frontend \
-            -n production \
-            --timeout=300s
+        run: kubectl rollout status deployment/frontend -n production --timeout=600s
 
       - name: Wait for user-service rollout
-        run: |
-          kubectl rollout status deployment/user-service \
-            -n production \
-            --timeout=300s
+        run: kubectl rollout status deployment/user-service -n production --timeout=600s
 
       - name: Wait for student-service rollout
-        run: |
-          kubectl rollout status deployment/student-service \
-            -n production \
-            --timeout=300s
+        run: kubectl rollout status deployment/student-service -n production --timeout=600s
 
       - name: Wait for lecturer-service rollout
-        run: |
-          kubectl rollout status deployment/lecturer-service \
-            -n production \
-            --timeout=300s
+        run: kubectl rollout status deployment/lecturer-service -n production --timeout=600s
 
       - name: Wait for course-service rollout
-        run: |
-          kubectl rollout status deployment/course-service \
-            -n production \
-            --timeout=300s
+        run: kubectl rollout status deployment/course-service -n production --timeout=600s
 
       - name: Wait for enrollment-service rollout
-        run: |
-          kubectl rollout status deployment/enrollment-service \
-            -n production \
-            --timeout=300s
+        run: kubectl rollout status deployment/enrollment-service -n production --timeout=600s
 
       - name: Show production resources
         run: |

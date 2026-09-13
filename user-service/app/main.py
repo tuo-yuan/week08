@@ -3,7 +3,9 @@ import os
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import Response
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
@@ -20,6 +22,17 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+HTTP_REQUESTS = Counter(
+    "user_service_http_requests_total",
+    "User service HTTP requests.",
+    ["method", "route", "status"],
+)
+HTTP_REQUEST_DURATION = Histogram(
+    "user_service_http_request_duration_seconds",
+    "User service HTTP request duration in seconds.",
+    ["method", "route"],
+)
 
 
 def initialise_database() -> None:
@@ -118,6 +131,33 @@ app = FastAPI(
 
 app.include_router(auth.router)
 app.include_router(users.router)
+
+
+@app.middleware("http")
+async def record_http_metrics(request: Request, call_next):
+    if request.url.path == "/metrics":
+        return await call_next(request)
+
+    started = time.perf_counter()
+    status = "500"
+    try:
+        response = await call_next(request)
+        status = str(response.status_code)
+        return response
+    finally:
+        route = getattr(request.scope.get("route"), "path", "unmatched")
+        method = request.method if request.method in {
+            "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE", "CONNECT"
+        } else "OTHER"
+        HTTP_REQUESTS.labels(method, route, status).inc()
+        HTTP_REQUEST_DURATION.labels(method, route).observe(
+            time.perf_counter() - started
+        )
+
+
+@app.get("/metrics", include_in_schema=False)
+def metrics() -> Response:
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get(
