@@ -1,24 +1,77 @@
 name: 04 - Deploy to Production
 
 on:
-  workflow_dispatch:
-    inputs:
-      image_tag:
-        description: "Tested image SHA to deploy"
-        required: true
-        type: string
+  workflow_run:
+    workflows:
+      - "03 - Test Staging"
+    types:
+      - completed
+    branches:
+      - main
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: production-deployment
+  cancel-in-progress: false
 
 jobs:
   deploy-production:
     name: Deploy to Production
     runs-on: ubuntu-latest
 
+    if: >
+      ${{ github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.head_repository.full_name == github.repository }}
+
     environment:
       name: production
 
+    env:
+      ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
+
     steps:
-      - name: Checkout repository
+      - name: Download tested release
+        uses: actions/download-artifact@v8
+        with:
+          name: tested-release
+          path: release
+          repository: ${{ github.repository }}
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      - name: Validate tested image SHA before checkout
+        id: release
+        run: |
+          set -euo pipefail
+
+          release_file="$GITHUB_WORKSPACE/release/image-tag.txt"
+          if [[ ! -f "$release_file" ]]; then
+            echo "The tested release artifact did not contain image-tag.txt." >&2
+            exit 1
+          fi
+
+          mapfile -t release_lines < "$release_file"
+          if (( ${#release_lines[@]} != 1 )); then
+            echo "The tested release artifact must contain exactly one line." >&2
+            exit 1
+          fi
+
+          image_sha="${release_lines[0]}"
+          if [[ ! "$image_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "The tested release artifact did not contain a valid image SHA." >&2
+            exit 1
+          fi
+
+          echo "image_sha=$image_sha" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_SHA=$image_sha" >> "$GITHUB_ENV"
+
+      - name: Checkout tested commit
         uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.release.outputs.image_sha }}
 
       - name: Login to Azure
         uses: azure/login@v3
@@ -69,37 +122,37 @@ jobs:
       - name: Update frontend image
         run: |
           kubectl set image deployment/frontend \
-            frontend=${{ vars.ACR_LOGIN_SERVER }}/koalatech-frontend:${{ inputs.image_tag }} \
+            frontend="${ACR_LOGIN_SERVER}/koalatech-frontend:${IMAGE_SHA}" \
             -n production
 
       - name: Update user-service image
         run: |
           kubectl set image deployment/user-service \
-            user-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-user-service:${{ inputs.image_tag }} \
+            user-service="${ACR_LOGIN_SERVER}/koalatech-user-service:${IMAGE_SHA}" \
             -n production
 
       - name: Update student-service image
         run: |
           kubectl set image deployment/student-service \
-            student-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-student-service:${{ inputs.image_tag }} \
+            student-service="${ACR_LOGIN_SERVER}/koalatech-student-service:${IMAGE_SHA}" \
             -n production
 
       - name: Update lecturer-service image
         run: |
           kubectl set image deployment/lecturer-service \
-            lecturer-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-lecturer-service:${{ inputs.image_tag }} \
+            lecturer-service="${ACR_LOGIN_SERVER}/koalatech-lecturer-service:${IMAGE_SHA}" \
             -n production
 
       - name: Update course-service image
         run: |
           kubectl set image deployment/course-service \
-            course-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-course-service:${{ inputs.image_tag }} \
+            course-service="${ACR_LOGIN_SERVER}/koalatech-course-service:${IMAGE_SHA}" \
             -n production
 
       - name: Update enrollment-service image
         run: |
           kubectl set image deployment/enrollment-service \
-            enrollment-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-enrollment-service:${{ inputs.image_tag }} \
+            enrollment-service="${ACR_LOGIN_SERVER}/koalatech-enrollment-service:${IMAGE_SHA}" \
             -n production
 
       - name: Wait for frontend rollout
