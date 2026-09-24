@@ -1,0 +1,106 @@
+name: 05 - Verified release and bounded rollback
+run-name: "10.3HD ${{ inputs.scenario }} by @${{ github.actor }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: Controlled fixture to demonstrate the release guard
+        type: choice
+        required: true
+        default: healthy
+        options: [healthy, rollback, escalate]
+
+permissions:
+  contents: read
+  id-token: write
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: sit722-103hd-demo
+  cancel-in-progress: false
+
+jobs:
+  verified-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SCENARIO: ${{ inputs.scenario }}
+      ACR_NAME: sit722103hd2304184
+      ACR_SERVER: sit722103hd2304184.azurecr.io
+      AKS_GROUP: sit722-103hd-rg
+      AKS_NAME: sit722-103hd-aks
+      NAMESPACE: hd-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Test release-control decisions
+        run: python -m unittest discover -s ops -p 'test_rollback.py' -v
+      - name: Azure OIDC login
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID_102D }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID_102D }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID_102D }}
+      - name: Build and publish actual frontend plus fault fixtures
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          az acr login --name "$ACR_NAME"
+          docker build -t koalatech-base frontend
+          baseline_mode=healthy
+          candidate_mode=healthy
+          if [[ "$SCENARIO" == rollback || "$SCENARIO" == escalate ]]; then candidate_mode=faulty; fi
+          if [[ "$SCENARIO" == escalate ]]; then baseline_mode=faulty; fi
+          for role in baseline candidate; do
+            mode="$baseline_mode"
+            if [[ "$role" == candidate ]]; then mode="$candidate_mode"; fi
+            tag="$ACR_SERVER/koalatech-frontend-hd:$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$role"
+            docker build -f ops/demo/Dockerfile ops/demo \
+              --build-arg MODE="$mode" --build-arg RELEASE="$GITHUB_SHA-$GITHUB_RUN_ID-$role" -t "$tag"
+            docker push "$tag"
+            digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$tag")
+            if [[ ! "$digest" =~ @sha256:[0-9a-f]{64}$ ]]; then echo 'Missing immutable image digest'; exit 1; fi
+            echo "${role^^}_IMAGE=$digest" >> "$GITHUB_ENV"
+            printf '%s %s\n' "$role" "$digest" >> evidence/images.txt
+          done
+          printf 'commit=%s\nscenario=%s\nnamespace=%s\n' "$GITHUB_SHA" "$SCENARIO" "$NAMESPACE" > evidence/run.txt
+      - name: Seed isolated fixture (setup, not rollback logic)
+        run: |
+          set -euo pipefail
+          az aks get-credentials -g "$AKS_GROUP" -n "$AKS_NAME" --overwrite-existing
+          kubectl create namespace "$NAMESPACE"
+          envsubst '${BASELINE_IMAGE}' < ops/demo/deployment.yaml | kubectl apply -n "$NAMESPACE" -f -
+          kubectl rollout status deployment/frontend -n "$NAMESPACE" --timeout=180s
+          kubectl wait pod/http-probe -n "$NAMESPACE" --for=condition=Ready --timeout=120s
+          # The escalation fixture deliberately starts with an already-broken business route.
+          # Kubernetes /healthz readiness still passes, reproducing a bad rollback target.
+      - name: Deploy, measure, decide and recover once
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          python ops/rollback.py \
+            --namespace "$NAMESPACE" --deployment frontend --container frontend \
+            --image "$CANDIDATE_IMAGE" --probe-pod http-probe --url http://frontend/ \
+            --samples 20 --interval 2 --threshold 0.2 --warmup 10 --output evidence
+      - name: Save final Kubernetes state
+        if: always()
+        run: |
+          mkdir -p evidence
+          if kubectl get namespace "$NAMESPACE" >/dev/null 2>&1; then
+            kubectl get pods,replicasets,deployments,services -n "$NAMESPACE" -o wide > evidence/final-resources.txt
+            kubectl rollout history deployment/frontend -n "$NAMESPACE" > evidence/rollout-history.txt
+          fi
+      - name: Retain samples and decision even when release is rejected
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rollback-${{ inputs.scenario }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/
+          retention-days: 30
+          if-no-files-found: error
