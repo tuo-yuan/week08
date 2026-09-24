@@ -48,7 +48,7 @@ terraform -chdir=ops/infra plan -destroy -out=destroy.tfplan
 terraform -chdir=ops/infra apply destroy.tfplan
 ```
 
-Terraform also removes its demo-scope identity role assignment. Revoking the exposed demonstration webhook is also recommended after the exercise.
+Terraform normally removes its demo-scope identity role assignment too. In the Deakin lab execution, direct role-assignment deletion returned HTTP 403. Cleanup instead deleted only the dedicated `sit722-103hd-rg` resource group with `az group delete --name sit722-103hd-rg --yes`, then reconciled local state with `terraform -chdir=ops/infra apply -refresh-only`. The group, managed node group, AKS and ACR were verified absent afterwards. Use that fallback only for this disposable group, never a shared resource group. Revoking the exposed demonstration webhook is also recommended after the exercise.
 
 ## References
 
